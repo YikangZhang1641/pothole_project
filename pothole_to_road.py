@@ -8,10 +8,11 @@ import os, sys
 from collections import deque
 import triangle as tr
 import matplotlib.pyplot as plt
-import multiprocessing
+from multiprocessing import Process, Lock, Pool
 import shutil
 import trimesh
 from tqdm import tqdm
+import noise
 
 
 CORNER_LU = 0
@@ -27,10 +28,21 @@ if os.path.isdir(FOLDER_PATH):
 os.makedirs(FOLDER_PATH)
 PIT_LIST = os.listdir(os.path.join(CUR_PATH, "PitMesh")) 
 
+def tri_area(v1, v2, v3):
+    v1 = np.array(v1)
+    v2 = np.array(v2)
+    v3 = np.array(v3)
+    a = np.linalg.norm(v2 - v1)
+    b = np.linalg.norm(v3 - v2)
+    c = np.linalg.norm(v1 - v3)
+    s = (a + b + c) / 2
+    return np.sqrt(s * (s - a) * (s - b) * (s - c))
 
+###################################################################
 
+pits_to_embed = 100
+threshold_split = 0.1
 
-pits_to_embed = 200
 
 # road = o3d.io.read_triangle_mesh("/home/mias/Downloads/part_of_road.ply")
 road = o3d.io.read_triangle_mesh("/home/mias/Datasets/CarlaRoads/Town01_Road_Road.obj")
@@ -95,21 +107,38 @@ while generated < pits_to_embed:
     #     lines=o3d.utility.Vector2iVector(mesh_edges),
     # )
 
-    quires = []
-    for v in np.array(mesh.vertices):
-        quires.append([v[0], v[1], v[2] + 1000, 0, 0, -1])
-    rays = o3d.core.Tensor(quires, dtype=o3d.core.Dtype.Float32)
 
+    ################ Generate Collision Testing Scene ################
     scene = o3d.t.geometry.RaycastingScene()
     road_tri = o3d.t.geometry.TriangleMesh.from_legacy(new_road)
     road_id = scene.add_triangles(road_tri)
 
+    ################ Collision Detection Level 0, corners ################
+    coarse_quires = []
+    for i in [CORNER_LU, CORNER_RU, CORNER_LD, CORNER_RD]:
+        v = mesh.vertices[i]
+        coarse_quires.append([v[0], v[1], v[2] + 1000, 0, 0, -1])
+    rays = o3d.core.Tensor(coarse_quires, dtype=o3d.core.Dtype.Float32)
     ans = scene.cast_rays(rays)
 
     collide = list(set(ans['primitive_ids'].numpy()))
     if scene.INVALID_ID in collide:
-        print(log_prefix, "outside of map!")
+        print(log_prefix, "Corner out of map!")
         continue
+
+    ############### Collision Detection Level 1, all vertices ##############
+    quires = []
+    for v in np.array(mesh.vertices):
+        quires.append([v[0], v[1], v[2] + 1000, 0, 0, -1])
+    rays = o3d.core.Tensor(quires, dtype=o3d.core.Dtype.Float32)
+    ans = scene.cast_rays(rays)
+
+    collide = list(set(ans['primitive_ids'].numpy()))
+    if scene.INVALID_ID in collide:
+        print(log_prefix, "Vertex out of map!")
+        continue
+
+    ######################################################
 
     border = []
     for c in collide:
@@ -196,15 +225,137 @@ while generated < pits_to_embed:
     # pbar.update(1)
     print(log_prefix, "Successfully generated", pit_name, "at", x, y, yaw)
 
+
+verts = np.array(road.vertices)
+tris = np.array(road.triangles)
+print("verts ", verts.shape[0], " tris ", tris.shape[0])
+
+tri_coord = verts[tris]
+small_pieces = []
+large_pieces = []
+for i in tqdm(range(tri_coord.shape[0])):
+    area = tri_area(tri_coord[i][0], tri_coord[i][1], tri_coord[i][2])
+    if area < threshold_split:
+        small_pieces.append(tris[i])
+    else:
+        large_pieces.append(tris[i])
+
+def pit_remapping(origin_verts, small_pieces):
+    mapping = dict()
+    new_t = []
+    new_v = []
+    for p in small_pieces:
+        for i in range(3):
+            if p[i] not in mapping:
+                mapping[p[i]] = len(new_v)
+                new_v.append(origin_verts[p[i]])
+
+        tmp = []
+        for i in range(3):
+            tmp.append(mapping[p[i]])
+        new_t.append(tmp)
+    return np.array(new_v), np.array(new_t)
+
+_v, _t = pit_remapping(verts, small_pieces)
+p_vertices = [_v]
+p_triangles = [_t]
+
+pbar = tqdm(total=len(large_pieces))
+lock = Lock()
+def f(q_pts):
+    global lock, p_vertices, triangles, pbar
+    
+    q_seg = np.array([[0,1],[1,2],[2,0]])
+    A = dict(vertices=q_pts, segments=q_seg)
+    s = 'qpa'+str(threshold_split)
+    B = tr.triangulate(A, opts=s)
+    # B = tr.triangulate(A, 'qpa0.1')
+    
+    lock.acquire()
+    try:
+        offset = 0
+        if len(p_vertices) != 0:
+            offset = np.vstack(p_vertices).shape[0]
+
+        new_verts = np.concatenate([np.array(B['vertices']), np.zeros([B['vertices'].shape[0], 1])], axis=1)
+        p_vertices.append(new_verts)
+
+        new_faces = offset + B['triangles']
+        p_triangles.append(new_faces)
+        
+    finally:
+        # print("verts add", new_verts.shape[0], "/", np.array(p_vertices).shape[0])
+        pbar.update(1)
+        lock.release()
+
+data = []
+for _i in range(len(large_pieces)):
+    tri_to_split_id = large_pieces[_i]
+    q_pts = verts[tri_to_split_id][:,:2]
+    f(q_pts)
+#     data.append(q_pts)
+
+# pool = Pool(20)
+# res = pool.map(f, data)
+# pool.close()
+# pool.join()
+
+
+
+p_vertices = np.vstack(p_vertices)
+p_triangles = np.vstack(p_triangles)
+
+################ Height Noise modelization ####################
+def height_modulization(p_vertices):
+    x_max = p_vertices[:,0].max()
+    x_min = p_vertices[:,0].min()
+    y_max = p_vertices[:,1].max()
+    y_min = p_vertices[:,1].min()
+    print(x_max, x_min, y_max, y_min)
+
+    GRID_SIZE = 0.3
+    HEIGHT_RANGE = 0.015
+
+    width = int((x_max - x_min) // GRID_SIZE) + 2
+    height = int((y_max - y_min) // GRID_SIZE) + 2
+    # scale = 50.0
+
+    # Generate a 2D grid of Perlin noise values
+    perlin_grid = np.zeros((width, height))
+    for x in range(width):
+        for y in range(height):
+            perlin_grid[x][y] = noise.snoise2(x, y)
+    perlin_grid = perlin_grid * HEIGHT_RANGE
+
+    for i in range(p_vertices.shape[0]):
+        x = p_vertices[i][0]
+        y = p_vertices[i][1]
+        # z = p_vertices[i][2]
+
+        l = int((x-x_min) // GRID_SIZE)
+        r = int((x-x_min) // GRID_SIZE) + 1
+        u = int((y-y_min) // GRID_SIZE)
+        d = int((y-y_min) // GRID_SIZE) + 1
+
+        dhx = (perlin_grid[r][u] - perlin_grid[l][u]) * ((x-x_min) / GRID_SIZE - l) 
+        dhy = (perlin_grid[l][d] - perlin_grid[l][u]) * ((y-y_min) / GRID_SIZE - u) 
+        
+        p_vertices[i][2] = p_vertices[i][2] + perlin_grid[l][d] + dhx + dhy
+    return p_vertices
+
+p_vertices = height_modulization(p_vertices)   
+road_save = o3d.geometry.TriangleMesh()
+road_save.vertices = o3d.utility.Vector3dVector(p_vertices)
+road_save.triangles = o3d.utility.Vector3iVector(p_triangles)
+
+
 print("TO WRITE")
+print("verts ", np.array(road_save.vertices).shape[0], " tris ", np.array(road_save.triangles).shape[0])
 
-
-
-
-
-road.vertices = o3d.utility.Vector3dVector(np.array(road.vertices) * 100)
-o3d.io.write_triangle_mesh(os.path.join(FOLDER_PATH, "pothole_road.obj"), road, print_progress=True)
 # o3d.visualization.draw_geometries([road, new_lines])
+
+# road.vertices = o3d.utility.Vector3dVector(np.array(road.vertices) * 100)
+o3d.io.write_triangle_mesh(os.path.join(FOLDER_PATH, "pothole_road.obj"), road_save, print_progress=True)
 
 
 
